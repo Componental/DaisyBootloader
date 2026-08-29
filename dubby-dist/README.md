@@ -3,6 +3,8 @@
 | File | What |
 |---|---|
 | `dubby_bootloader_v6_4-intdfu-2000ms-uid96.bin` | DaisyBootloader v6.4 + 96-bit serial + strings "Componental"/"Dubby". Reproduce with `./build_dubby.sh`. |
+| `dubby_bootloader_v6_4-extdfu-2000ms-uid96-hardening-v3.bin` (+ `.elf`) | 30 Aug, branch `dubby-bootloader-hardening`: extdfu-uid96 + stay-in-DFU-if-incomplete + encoder-hold DFU + worst-case poll timeouts. NOT flashed. Test plan: DEV-NOTES-MAREK/2026-08-30-bootloader-encoder-dfu.md §8. |
+| `dubby_bootloader_v6_4-extdfu-2000ms-uid96.bin` | production candidate as flashed 29 Aug (rollback image for the hardening build) |
 | `dsy_bootloader_v6_4-intdfu-2000ms-baseline-localbuild.bin` | unpatched, same toolchain — flash THIS first to prove the toolchain, then the one above |
 
 Built with Arm GNU Toolchain 15.3.Rel1 against libDaisy 24be4af (the bootloader's own pin, left
