@@ -9,6 +9,7 @@
 #include "usbd_dfu.h"
 #include "usbd_dfu_if.h"
 #include "system.h"
+#include "dubby_hardening.h"
 
 using namespace daisy;
 
@@ -91,6 +92,16 @@ uint32_t daisy::startup_process(QSPIHandle::Config* ext_qspi_cfg)
     // do startup permanently into boot/DFU mode (uint32_t max milliseconds, or 1000+ hours)
     return UINT32_MAX;
   }
+
+#ifdef DUBBY_STAY_IN_DFU_IF_INCOMPLETE
+  // A previous DFU download started but never reached manifest: the image in
+  // QSPI may be half-written. Stay in DFU until a download completes (the
+  // marker is cleared in enable_jump()) or power is cycled.
+  if (dubby_dfu_marker_is_set())
+  {
+    return UINT32_MAX;
+  }
+#endif
 
   return DSY_BOOT_TIMEOUT_MS;
 }
@@ -297,6 +308,13 @@ void Bootloader::LoadProgramAndJump(uint8_t error_code)
   // __set_MSP(*(__IO uint32_t *)program_start);
   // application();
 
+#ifdef DUBBY_STAY_IN_DFU_IF_INCOMPLETE
+  // Every jump from here follows a complete load (DFU manifest, SD or USB
+  // file); the timeout jump cannot run while the marker is set because the
+  // timeout is infinite. Clear it so a fresh SD/USB load is not mistaken for
+  // an incomplete DFU download on the next reset.
+  dubby_dfu_marker_clear();
+#endif
   boot_info.status = System::BootInfo::Type::JUMP;
   boot_info.data = program_start;
 

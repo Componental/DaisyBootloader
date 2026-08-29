@@ -10,6 +10,7 @@
 #include "system.h"
 
 #include "dfu_log.h"
+#include "dubby_hardening.h"
 
 using namespace daisy;
 
@@ -168,6 +169,10 @@ DFUHandle::Result DFUHandle::Impl::MemoryErase(uint32_t Add)
     if (System::GetMemoryRegion(Add) == System::MemoryRegion::QSPI)
     {
         dfu_initiated = true;
+#ifdef DUBBY_STAY_IN_DFU_IF_INCOMPLETE
+        // Download has started: stay in DFU after a reset until it completes
+        dubby_dfu_marker_set();
+#endif
         io_state.busy = true;
         io_state.type = IoStatus::Type::Erase;
         io_state.start_time = System::GetNow();
@@ -206,6 +211,11 @@ DFUHandle::Result DFUHandle::Impl::MemoryWrite(uint8_t *src, uint8_t *dest, uint
     if (System::GetMemoryRegion((uint32_t)dest) == System::System::MemoryRegion::QSPI) {
         // Copy data to scratch buffer
         std::copy(src, src+ Len, io_buffer);
+
+#ifdef DUBBY_STAY_IN_DFU_IF_INCOMPLETE
+        dfu_initiated = true;
+        dubby_dfu_marker_set();
+#endif
 
         io_state.busy = true;
         io_state.type = IoStatus::Type::Write;
@@ -491,6 +501,10 @@ extern "C"
 
     void enable_jump()
     {
+#ifdef DUBBY_STAY_IN_DFU_IF_INCOMPLETE
+        // Manifest reached: the image in QSPI is complete
+        dubby_dfu_marker_clear();
+#endif
         dfu_impl.dfu_complete = true;
     }
 }
