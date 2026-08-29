@@ -17,6 +17,18 @@ using namespace daisy;
 #define DSY_BOOT_TIMEOUT_MS 2000
 #endif
 
+#ifdef DUBBY_ENCODER_DFU
+// Dubby rev 10: the encoder push switch is channel 3 of the 16:1 analog
+// control mux (select S1=PC4, S2=PB1, S3=PB12, S4=PA7, common=PC1). The switch
+// shorts the channel to ground. The bootloader selects channel 3 and reads the
+// common line as an active-low digital input with the MCU's internal pull-up
+// enabled (the rev 10 schematic was not available locally, so the code does
+// not rely on an external pull-up). Hold time filters out an accidental bump.
+#ifndef DUBBY_ENCODER_DFU_HOLD_MS
+#define DUBBY_ENCODER_DFU_HOLD_MS 300
+#endif
+#endif
+
 uint32_t daisy::startup_process(QSPIHandle::Config* ext_qspi_cfg)
 {
   // Enable backup SRAM
@@ -158,6 +170,19 @@ Bootloader::Result Bootloader::Init(QSPIHandle& qspi, Pin led_pin, Pin btn_pin, 
 
   boot_button_pressed_ = false;
   downloading_binary_ = false;
+
+#ifdef DUBBY_ENCODER_DFU
+  {
+    const Pin  sel_pin[4]   = {Pin(PORTC, 4), Pin(PORTB, 1), Pin(PORTB, 12), Pin(PORTA, 7)};
+    const bool sel_level[4] = {true, true, false, false}; // channel 3 = 0b0011, bit 0 first
+    for (int i = 0; i < 4; i++)
+    {
+      enc_sel_[i].Init(sel_pin[i], GPIO::Mode::OUTPUT);
+      enc_sel_[i].Write(sel_level[i]);
+    }
+    enc_button_.Init(Pin(PORTC, 1), 1000, Switch::TYPE_MOMENTARY, Switch::POLARITY_INVERTED, GPIO::Pull::PULLUP);
+  }
+#endif
 
   state_ = State::CHECK_SD;
 
@@ -418,6 +443,17 @@ void Bootloader::AudioProcess(AudioHandle::InputBuffer in, AudioHandle::OutputBu
     boot_button_pressed_ = true;
     do_happy_ = true;
   }
+
+#ifdef DUBBY_ENCODER_DFU
+  enc_button_.Debounce();
+  if (!boot_button_pressed_ && enc_button_.Pressed()
+      && enc_button_.TimeHeldMs() >= DUBBY_ENCODER_DFU_HOLD_MS)
+  {
+    // Same latch as BOOT: never cleared, so the bootloader stays in DFU
+    boot_button_pressed_ = true;
+    do_happy_ = true;
+  }
+#endif
 }
 
 void Bootloader::LoopProcess()

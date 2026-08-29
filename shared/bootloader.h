@@ -164,6 +164,10 @@ class Bootloader
 
     Switch boot_button_;
     bool boot_button_pressed_;
+#ifdef DUBBY_ENCODER_DFU
+    Switch enc_button_;  // Dubby rev 10 encoder switch, read through the control mux
+    GPIO   enc_sel_[4];  // mux select lines S1..S4
+#endif
     bool dfu_initialized_;
 
     bool downloading_binary_;
