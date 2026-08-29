@@ -478,6 +478,18 @@ void Bootloader::LoopProcess()
       break;
     }
 
+#ifdef DUBBY_DFU_POLL_TIMEOUTS
+    // While a DFU download is in progress, do not re-mount / re-scan the SD
+    // card on every loop: SearchBin() blocks the main loop for milliseconds
+    // (SDMMC reads, or init timeouts with no card), which delays the queued
+    // QSPI job past the bwPollTimeout advertised to the host.
+    if (dfu.GetDfuInitiated())
+    {
+      state_ = next_state;
+      break;
+    }
+#endif
+
     FatFS_Path_ = fsi_.GetSDPath();
     FatFS_Obj_ = &fsi_.GetSDFileSystem();
 

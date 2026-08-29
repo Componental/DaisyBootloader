@@ -269,6 +269,42 @@ DFUHandle::Result DFUHandle::Impl::MemoryStatus(uint32_t Add, uint8_t Cmd, uint8
     uint32_t tstart = System::GetNow();
     switch (Cmd)
     {
+#ifdef DUBBY_DFU_POLL_TIMEOUTS
+    // The ST DFU class calls MEM_If_Write/Erase from EP0_TxReady, i.e. right
+    // after the GETSTATUS reply that carries this bwPollTimeout has been sent.
+    // Our Write/Erase only queue the job (io_state) and the QSPI work happens
+    // later in the main loop; the next Write/Erase returns ERR (-> dfuERROR,
+    // bStatus errVENDOR) if the previous job is still busy. So the advertised
+    // timeout must cover the WORST-CASE duration of the job just queued, not
+    // the typical one, or a host that polls on time (dfu-util) will send the
+    // next block too early. IS25LP064A datasheet maxima (see comments below):
+    // page program 0.8 ms per 256 B, 64 KB block erase 1.0 s.
+    case DFU_MEDIA_PROGRAM:
+    {
+        // One transfer = USBD_DFU_XFER_SIZE bytes = N pages of 256 B
+        uint32_t timeout = (USBD_DFU_XFER_SIZE / 256U) * 1U /* ms, >= 0.8 max */ + 4U /* margin */;
+        buffer[0] = 0; // bStatus (0 = OK)
+        buffer[1] = (uint8_t)(timeout & 0xffU);
+        buffer[2] = (uint8_t)((timeout >> 8) & 0xffU);
+        buffer[3] = (uint8_t)((timeout >> 16) & 0xffU);
+        buffer[4] = 4; // bState (4 = dfuDNBUSY)
+        buffer[5] = 0; // no state string
+        break;
+    }
+    default:
+    case DFU_MEDIA_ERASE:
+    {
+        // 64 KB block erase: typ 0.15 s, max 1.0 s (datasheet), plus margin
+        uint32_t timeout = 1000U + 100U;
+        buffer[0] = 0; // bStatus (0 = OK)
+        buffer[1] = (uint8_t)(timeout & 0xffU);
+        buffer[2] = (uint8_t)((timeout >> 8) & 0xffU);
+        buffer[3] = (uint8_t)((timeout >> 16) & 0xffU);
+        buffer[4] = 4; // bState (4 = dfuDNBUSY)
+        buffer[5] = 0; // no state string
+        break;
+    }
+#else
     case DFU_MEDIA_PROGRAM:
         buffer[0] = 0; // bStatus (0 = OK) TODO -- make this actually check the status
         // I'm assuming this is little-endian
@@ -303,6 +339,7 @@ DFUHandle::Result DFUHandle::Impl::MemoryStatus(uint32_t Add, uint8_t Cmd, uint8
         buffer[4] = 4;   // bState (4 = dfuDNBUSY)
         buffer[5] = 0;   // no state string
         break;
+#endif // DUBBY_DFU_POLL_TIMEOUTS
     }
     uint32_t tend = System::GetNow();
     auto dur = tend - tstart;
