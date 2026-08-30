@@ -10,8 +10,11 @@
  *       reached the manifest stage leaves a marker in backup SRAM. On the
  *       next reset the bootloader sees the marker and stays in DFU with an
  *       infinite timeout (same latch as the BOOT button) instead of jumping
- *       into the half-written image. The marker is cleared on a successful
- *       manifest and before any bootloader-initiated jump (SD/USB load).
+ *       into the half-written image. The marker is cleared when the host
+ *       issues the DFU leave request after a complete download (LeaveDFU
+ *       hook, requires USBD_DFU_VENDOR_EXIT_ENABLED=1) and before any
+ *       bootloader-initiated jump (SD/USB load). It is NOT cleared in
+ *       enable_jump(): nothing in the bootloader calls that function.
  */
 #ifndef DUBBY_HARDENING_H
 #define DUBBY_HARDENING_H

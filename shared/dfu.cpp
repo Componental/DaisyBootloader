@@ -460,6 +460,9 @@ extern "C"
     uint8_t *MEM_If_Read_FS(uint8_t *src, uint8_t *dest, uint32_t Len);
     uint16_t MEM_If_DeInit_FS(void);
     uint16_t MEM_If_GetStatus_FS(uint32_t Add, uint8_t Cmd, uint8_t *buffer);
+#if (USBD_DFU_VENDOR_EXIT_ENABLED == 1U)
+    uint16_t MEM_If_Leave_FS(uint32_t Add);
+#endif
 
     __ALIGN_BEGIN USBD_DFU_MediaTypeDef USBD_DFU_fops_FS __ALIGN_END =
         {
@@ -469,7 +472,11 @@ extern "C"
             MEM_If_Erase_FS,
             MEM_If_Write_FS,
             MEM_If_Read_FS,
-            MEM_If_GetStatus_FS};
+            MEM_If_GetStatus_FS,
+#if (USBD_DFU_VENDOR_EXIT_ENABLED == 1U)
+            MEM_If_Leave_FS,
+#endif
+    };
 
     /**
      * @brief  Memory initialization routine.
@@ -536,14 +543,36 @@ extern "C"
         return dfu_impl.MemoryStatus(Add, Cmd, buffer);
     }
 
+    // NOTE: nothing in this build calls enable_jump(). The ST DFU class leaves
+    // DFU mode from DFU_Leave() with USBD_Stop() + NVIC_SystemReset(); the
+    // application is then started by the bootloader's boot timeout after the
+    // reset. The only hook on that path is LeaveDFU (USBD_DFU_VENDOR_EXIT_ENABLED).
     void enable_jump()
     {
+        dfu_impl.dfu_complete = true;
+    }
+
+#if (USBD_DFU_VENDOR_EXIT_ENABLED == 1U)
+    /**
+     * @brief  Called by the ST DFU class from DFU_Leave() after USBD_Stop(),
+     *         i.e. the host has finished the download and issued the leave
+     *         request (manifest complete). With USBD_DFU_VENDOR_EXIT_ENABLED
+     *         the class does not reset by itself, so this function must.
+     *         Behaviour is identical to the stock class (system reset, then
+     *         the normal boot timeout starts the application), plus clearing
+     *         the incomplete-download marker first.
+     */
+    uint16_t MEM_If_Leave_FS(uint32_t Add)
+    {
+        (void)Add;
 #ifdef DUBBY_STAY_IN_DFU_IF_INCOMPLETE
         // Manifest reached: the image in QSPI is complete
         dubby_dfu_marker_clear();
 #endif
-        dfu_impl.dfu_complete = true;
+        NVIC_SystemReset();
+        return (USBD_OK);
     }
+#endif /* USBD_DFU_VENDOR_EXIT_ENABLED */
 }
 
 /////////////////////////////////////////////////
