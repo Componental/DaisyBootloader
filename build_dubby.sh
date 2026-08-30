@@ -18,4 +18,10 @@ cp bootloader/build/dsy_bootloader_v6_4-extdfu-2000ms.elf dubby-dist/dubby_bootl
 make -C bootloader clean
 make -C bootloader TARGET_SUFFIX="-intdfu-2000ms" EXTRA_C_DEFS="$STR"
 cp bootloader/build/dsy_bootloader_v6_4-intdfu-2000ms.bin dubby-dist/dubby_bootloader_v6_4-intdfu-2000ms-uid96.bin
+# Bench variant: intdfu + the same hardening defines, for testing the hardening
+# on a bare Seed2 DFM over its micro-USB before touching a Dubby. Not for production.
+make -C bootloader clean
+make -C bootloader TARGET_SUFFIX="-intdfu-2000ms" EXTRA_C_DEFS="$STR $HARDENING"
+cp bootloader/build/dsy_bootloader_v6_4-intdfu-2000ms.bin dubby-dist/dubby_bootloader_v6_4-intdfu-2000ms-uid96-hardening-v3-bench.bin
+cp bootloader/build/dsy_bootloader_v6_4-intdfu-2000ms.elf dubby-dist/dubby_bootloader_v6_4-intdfu-2000ms-uid96-hardening-v3-bench.elf
 ls -l dubby-dist/*.bin
