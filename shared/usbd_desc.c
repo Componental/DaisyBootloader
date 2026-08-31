@@ -74,10 +74,10 @@ _Static_assert(USB_SIZ_STRING_SERIAL == 2 + 2 * USB_SERIAL_HEX_CHARS,
   */
 
 #ifndef DSY_USB_DESC_MFR_STR
-#define DSY_USB_DESC_MFR_STR "Electrosmith"
+#define DSY_USB_DESC_MFR_STR "Componental"
 #endif
 #ifndef DSY_USB_DESC_PRODUCT_STR
-#define DSY_USB_DESC_PRODUCT_STR "Daisy Bootloader"
+#define DSY_USB_DESC_PRODUCT_STR "Dubby"
 #endif
 
 #define USBD_VID     1155
