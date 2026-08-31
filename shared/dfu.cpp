@@ -18,6 +18,7 @@ static constexpr const size_t kMaxDfuProgramSize = 8192;
 
 static DfuLogger __attribute__((section(".dtcmram_bss"))) dfu_log;
 static uint8_t __attribute__((section(".dtcmram_bss"))) gDfuWriteBuffer[kMaxDfuProgramSize];
+static uint8_t __attribute__((section(".dtcmram_bss"))) gDfuWriteBuffer2[kMaxDfuProgramSize];
 
 #define DSY_DTCMRAM_BSS __attribute__((section(".dtcmram_bss")))
 
@@ -51,6 +52,8 @@ public:
     /** Handles the I/O  */
     Result ProcessIoRequests();
 
+    bool IsIoIdle() { return !io_slots[0].busy && !io_slots[1].busy; }
+
     bool dfu_complete;
     bool dfu_initiated;
 
@@ -67,22 +70,43 @@ private:
             Idle,
         };
 
-        bool busy;
+        // busy is the publication flag between the USB interrupt (producer)
+        // and the main loop (consumer): the ISR fills every other field first
+        // and sets busy last; the consumer clears it when the job is done.
+        volatile bool busy;
         Type type;
         uint32_t start_address, length;
         uint32_t start_time;
+        uint32_t seq;  // execution order (assigned by the ISR only)
+        uint8_t* buf;  // slot-private data buffer (writes only)
 
         IoStatus()
             : busy(false),
               type(Type::Idle),
               start_address(0),
               length(0),
-              start_time(0) {}
+              start_time(0),
+              seq(0),
+              buf(nullptr) {}
     };
 
-    IoStatus io_state;
-    uint8_t* io_buffer;
+    // Two-deep job queue. The ST DFU class hands us the next chunk from the
+    // USB interrupt as soon as the host's bwPollTimeout expires; if the main
+    // loop happens to be a little behind (SD scan, slow QSPI cycle), the old
+    // single slot was still busy and the transfer died with errVENDOR. A
+    // second slot absorbs that overlap; order is kept via seq.
+    IoStatus io_slots[2];
+    volatile uint32_t io_seq_next = 0;  // written from the ISR only
+    uint8_t* io_buffer;                 // slot 0 buffer (init)
     size_t io_buffer_size;
+
+    // ISR context: find a free slot, or nullptr if both are pending.
+    IoStatus* ClaimSlot()
+    {
+        if (!io_slots[0].busy) return &io_slots[0];
+        if (!io_slots[1].busy) return &io_slots[1];
+        return nullptr;
+    }
 
 
     QSPIHandle* qspi_;
@@ -120,6 +144,11 @@ DFUHandle::Result DFUHandle::Impl::Init(QSPIHandle* qspi)
 
     io_buffer = gDfuWriteBuffer;
     io_buffer_size = kMaxDfuProgramSize;
+    io_slots[0] = IoStatus();
+    io_slots[1] = IoStatus();
+    io_slots[0].buf = gDfuWriteBuffer;
+    io_slots[1].buf = gDfuWriteBuffer2;
+    io_seq_next = 0;
 
     qspi_ = qspi;
 
@@ -160,8 +189,8 @@ DFUHandle::Result DFUHandle::Impl::MemoryErase(uint32_t Add)
     // DFU download has begun, so we shouldn't allow a jump
     // to happen before it completes
 
-    if (io_state.busy) {
-        // Presumably ok to still busy here..?
+    IoStatus* slot = ClaimSlot();
+    if (!slot) {
         dfu_log.pushEvent(DfuLogger::Event::Type::EraseBusy, System::GetNow(), Add, sector_size_, 0);
         return Result::ERR;
     }
@@ -173,11 +202,12 @@ DFUHandle::Result DFUHandle::Impl::MemoryErase(uint32_t Add)
         // Download has started: stay in DFU after a reset until it completes
         dubby_dfu_marker_set();
 #endif
-        io_state.busy = true;
-        io_state.type = IoStatus::Type::Erase;
-        io_state.start_time = System::GetNow();
-        io_state.start_address = Add;
-        io_state.length = sector_size_;
+        slot->type = IoStatus::Type::Erase;
+        slot->start_time = System::GetNow();
+        slot->start_address = Add;
+        slot->length = sector_size_;
+        slot->seq = io_seq_next++;
+        slot->busy = true;  // publish last
         return Result::OK;
     }
 
@@ -203,25 +233,27 @@ DFUHandle::Result DFUHandle::Impl::MemoryErase(uint32_t Add)
 DFUHandle::Result DFUHandle::Impl::MemoryWrite(uint8_t *src, uint8_t *dest, uint32_t Len)
 {
 
-    if (io_state.busy) {
+    IoStatus* slot = ClaimSlot();
+    if (!slot) {
         dfu_log.pushEvent(DfuLogger::Event::Type::WriteBusy, System::GetNow(), (uint32_t)dest, Len, 0);
         return Result::ERR;
     }
 
     if (System::GetMemoryRegion((uint32_t)dest) == System::System::MemoryRegion::QSPI) {
-        // Copy data to scratch buffer
-        std::copy(src, src+ Len, io_buffer);
+        // Copy data to the slot's own scratch buffer
+        std::copy(src, src + Len, slot->buf);
 
 #ifdef DUBBY_STAY_IN_DFU_IF_INCOMPLETE
         dfu_initiated = true;
         dubby_dfu_marker_set();
 #endif
 
-        io_state.busy = true;
-        io_state.type = IoStatus::Type::Write;
-        io_state.start_time = System::GetNow();
-        io_state.start_address = (uint32_t)dest;
-        io_state.length = Len;
+        slot->type = IoStatus::Type::Write;
+        slot->start_time = System::GetNow();
+        slot->start_address = (uint32_t)dest;
+        slot->length = Len;
+        slot->seq = io_seq_next++;
+        slot->busy = true;  // publish last
         return Result::OK;
     }
 
@@ -399,48 +431,53 @@ DFUHandle::Result DFUHandle::Impl::ProcessIoRequests()
         // io_state.start_address = Add;
         // io_state.length = sector_size_;
 
-    // Only one request can be handled at a time so we have one state
-    // instead of list of requests, etc.
-    if (io_state.busy) {
-        // take care of business
-        switch(io_state.type) {
+    // Process queued jobs in submission order. The ISR never touches a slot
+    // whose busy flag is set, so reading a busy slot's fields here is safe.
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        IoStatus* job = nullptr;
+        if (io_slots[0].busy && io_slots[1].busy)
+            job = ((int32_t)(io_slots[0].seq - io_slots[1].seq) < 0) ? &io_slots[0] : &io_slots[1];
+        else if (io_slots[0].busy)
+            job = &io_slots[0];
+        else if (io_slots[1].busy)
+            job = &io_slots[1];
+        if (!job)
+            break;
+
+        switch (job->type) {
             case IoStatus::Type::Erase:
             {
-                uint32_t normalized_addr = io_state.start_address - addr_offset_;
-                qspi_->Erase(normalized_addr, normalized_addr + io_state.length);
+                uint32_t normalized_addr = job->start_address - addr_offset_;
+                qspi_->Erase(normalized_addr, normalized_addr + job->length);
                 dfu_log.pushEvent(
                     DfuLogger::Event::Type::Erase,
-                    io_state.start_time,
-                    io_state.start_address,
-                    io_state.length,
-                    System::GetNow() - io_state.start_time
+                    job->start_time,
+                    job->start_address,
+                    job->length,
+                    System::GetNow() - job->start_time
                 );
-                // Clear busy flag
-                io_state.busy = false;
             }
             break;
             case IoStatus::Type::Write:
             {
-                uint32_t normalized_addr = io_state.start_address - addr_offset_;
-                qspi_->Write(normalized_addr, io_state.length, io_buffer);
+                uint32_t normalized_addr = job->start_address - addr_offset_;
+                qspi_->Write(normalized_addr, job->length, job->buf);
                 dfu_log.pushEvent(
                     DfuLogger::Event::Type::Write,
-                    io_state.start_time,
-                    io_state.start_address,
-                    io_state.length,
-                    System::GetNow() - io_state.start_time
+                    job->start_time,
+                    job->start_address,
+                    job->length,
+                    System::GetNow() - job->start_time
                 );
-                data_written_ += io_state.length;
-                // Clear busy flag
-                io_state.busy = false;
+                data_written_ += job->length;
             }
             break;
             case IoStatus::Type::Idle:
-            io_state.busy = false;
             break;
         }
+        job->busy = false;  // release the slot last
     }
-
 
     return Result::OK;
 }
@@ -588,6 +625,11 @@ DFUHandle::Result DFUHandle::Init(QSPIHandle* qspi)
 DFUHandle::Result DFUHandle::DeInit()
 {
     return pimpl_->DeInit();
+}
+
+bool DFUHandle::IsIoIdle()
+{
+    return pimpl_->IsIoIdle();
 }
 
 bool DFUHandle::GetDfuComplete()

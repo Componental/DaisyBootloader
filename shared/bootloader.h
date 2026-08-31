@@ -137,6 +137,7 @@ class Bootloader
     USBHostHandle msd_;
 
     bool sd_skip_;
+    uint32_t sd_rescan_after_ms_ = 0;
     bool usb_skip_;
     FIL FatfsFile_;
 

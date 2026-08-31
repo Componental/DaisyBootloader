@@ -488,6 +488,11 @@ void Bootloader::LoopProcess()
       state_ = next_state;
       break;
     }
+    if (System::GetNow() < sd_rescan_after_ms_)
+    {
+      state_ = next_state;
+      break;
+    }
 #endif
 
     FatFS_Path_ = fsi_.GetSDPath();
@@ -517,6 +522,14 @@ void Bootloader::LoopProcess()
     else if (res == FatfsResult::ABSENT)
     {
       state_ = next_state;
+#ifdef DUBBY_DFU_POLL_TIMEOUTS
+      // No card / no .bin: do not rescan on every loop iteration. With an
+      // empty slot each scan runs into SDMMC init timeouts and blocks the
+      // loop long enough to starve queued DFU writes. Rescan twice a second
+      // so an inserted recovery card is still picked up (stay-in-DFU mode
+      // waits indefinitely and must keep honouring the SD path).
+      sd_rescan_after_ms_ = System::GetNow() + 500;
+#endif
     }
     break;
   }
@@ -567,7 +580,9 @@ void Bootloader::LoopProcess()
   }
   case State::CHECK_DFU:
   {
-    bool dfu_done = dfu.GetDfuComplete();
+    // Only jump once the job queue is drained, so the final chunks are
+    // actually on flash before the application starts.
+    bool dfu_done = dfu.GetDfuComplete() && dfu.IsIoIdle();
 
     if (dfu_done)
     {
