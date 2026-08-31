@@ -277,6 +277,16 @@ DFUHandle::Result DFUHandle::Impl::MemoryWrite(uint8_t *src, uint8_t *dest, uint
 DFUHandle::Result DFUHandle::Impl::MemoryRead(uint8_t *src, uint8_t *dest, uint32_t Len)
 {
     uint32_t tstart = System::GetNow();
+    // Diagnostic window: DFU UPLOAD from the DTCM region returns raw memory,
+    // so the dfu_log ring (0x20004000) can be pulled off a failed session with
+    // dfu-util -U before the device is reset.
+    uint32_t src_addr = (uint32_t)src;
+    if (src_addr >= 0x20000000U && (src_addr + Len) <= 0x20020000U)
+    {
+        for (size_t i = 0; i < Len; i++)
+            dest[i] = *((__IO uint8_t *)src_addr + i);
+        return Result::OK;
+    }
     if (System::GetMemoryRegion((uint32_t)src) == System::MemoryRegion::QSPI)
     {
         // TODO -- this will need to change for multi-programs
