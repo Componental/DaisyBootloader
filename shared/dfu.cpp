@@ -10,6 +10,7 @@
 #include "system.h"
 
 #include "dfu_log.h"
+#include "dubby_hardening.h"
 
 using namespace daisy;
 
@@ -17,6 +18,7 @@ static constexpr const size_t kMaxDfuProgramSize = 8192;
 
 static DfuLogger __attribute__((section(".dtcmram_bss"))) dfu_log;
 static uint8_t __attribute__((section(".dtcmram_bss"))) gDfuWriteBuffer[kMaxDfuProgramSize];
+static uint8_t __attribute__((section(".dtcmram_bss"))) gDfuWriteBuffer2[kMaxDfuProgramSize];
 
 #define DSY_DTCMRAM_BSS __attribute__((section(".dtcmram_bss")))
 
@@ -50,6 +52,8 @@ public:
     /** Handles the I/O  */
     Result ProcessIoRequests();
 
+    bool IsIoIdle() { return !io_slots[0].busy && !io_slots[1].busy; }
+
     bool dfu_complete;
     bool dfu_initiated;
 
@@ -66,22 +70,47 @@ private:
             Idle,
         };
 
-        bool busy;
+        // busy is the publication flag between the USB interrupt (producer)
+        // and the main loop (consumer): the ISR fills every other field first
+        // and sets busy last; the consumer clears it when the job is done.
+        volatile bool busy;
         Type type;
         uint32_t start_address, length;
         uint32_t start_time;
+        uint32_t seq;  // execution order (assigned by the ISR only)
+        uint8_t* buf;  // slot-private data buffer (writes only)
 
         IoStatus()
             : busy(false),
               type(Type::Idle),
               start_address(0),
               length(0),
-              start_time(0) {}
+              start_time(0),
+              seq(0),
+              buf(nullptr) {}
     };
 
-    IoStatus io_state;
-    uint8_t* io_buffer;
+    // Two-deep job queue. The ST DFU class hands us the next chunk from the
+    // USB interrupt as soon as the host's bwPollTimeout expires; if the main
+    // loop happens to be a little behind (SD scan, slow QSPI cycle), the old
+    // single slot was still busy and the transfer died with errVENDOR. A
+    // second slot absorbs that overlap; order is kept via seq.
+    IoStatus io_slots[2];
+    volatile uint32_t io_seq_next = 0;  // written from the ISR only
+    // Measured QSPI service time of the most recent write job (processing
+    // only, excluding queue wait). Drives the advertised bwPollTimeout so the
+    // host paces itself to the actual flash speed instead of a constant.
+    volatile uint32_t last_write_ms = 0;
+    uint8_t* io_buffer;                 // slot 0 buffer (init)
     size_t io_buffer_size;
+
+    // ISR context: find a free slot, or nullptr if both are pending.
+    IoStatus* ClaimSlot()
+    {
+        if (!io_slots[0].busy) return &io_slots[0];
+        if (!io_slots[1].busy) return &io_slots[1];
+        return nullptr;
+    }
 
 
     QSPIHandle* qspi_;
@@ -119,6 +148,11 @@ DFUHandle::Result DFUHandle::Impl::Init(QSPIHandle* qspi)
 
     io_buffer = gDfuWriteBuffer;
     io_buffer_size = kMaxDfuProgramSize;
+    io_slots[0] = IoStatus();
+    io_slots[1] = IoStatus();
+    io_slots[0].buf = gDfuWriteBuffer;
+    io_slots[1].buf = gDfuWriteBuffer2;
+    io_seq_next = 0;
 
     qspi_ = qspi;
 
@@ -159,8 +193,8 @@ DFUHandle::Result DFUHandle::Impl::MemoryErase(uint32_t Add)
     // DFU download has begun, so we shouldn't allow a jump
     // to happen before it completes
 
-    if (io_state.busy) {
-        // Presumably ok to still busy here..?
+    IoStatus* slot = ClaimSlot();
+    if (!slot) {
         dfu_log.pushEvent(DfuLogger::Event::Type::EraseBusy, System::GetNow(), Add, sector_size_, 0);
         return Result::ERR;
     }
@@ -168,11 +202,16 @@ DFUHandle::Result DFUHandle::Impl::MemoryErase(uint32_t Add)
     if (System::GetMemoryRegion(Add) == System::MemoryRegion::QSPI)
     {
         dfu_initiated = true;
-        io_state.busy = true;
-        io_state.type = IoStatus::Type::Erase;
-        io_state.start_time = System::GetNow();
-        io_state.start_address = Add;
-        io_state.length = sector_size_;
+#ifdef DUBBY_STAY_IN_DFU_IF_INCOMPLETE
+        // Download has started: stay in DFU after a reset until it completes
+        dubby_dfu_marker_set();
+#endif
+        slot->type = IoStatus::Type::Erase;
+        slot->start_time = System::GetNow();
+        slot->start_address = Add;
+        slot->length = sector_size_;
+        slot->seq = io_seq_next++;
+        slot->busy = true;  // publish last
         return Result::OK;
     }
 
@@ -198,20 +237,27 @@ DFUHandle::Result DFUHandle::Impl::MemoryErase(uint32_t Add)
 DFUHandle::Result DFUHandle::Impl::MemoryWrite(uint8_t *src, uint8_t *dest, uint32_t Len)
 {
 
-    if (io_state.busy) {
+    IoStatus* slot = ClaimSlot();
+    if (!slot) {
         dfu_log.pushEvent(DfuLogger::Event::Type::WriteBusy, System::GetNow(), (uint32_t)dest, Len, 0);
         return Result::ERR;
     }
 
     if (System::GetMemoryRegion((uint32_t)dest) == System::System::MemoryRegion::QSPI) {
-        // Copy data to scratch buffer
-        std::copy(src, src+ Len, io_buffer);
+        // Copy data to the slot's own scratch buffer
+        std::copy(src, src + Len, slot->buf);
 
-        io_state.busy = true;
-        io_state.type = IoStatus::Type::Write;
-        io_state.start_time = System::GetNow();
-        io_state.start_address = (uint32_t)dest;
-        io_state.length = Len;
+#ifdef DUBBY_STAY_IN_DFU_IF_INCOMPLETE
+        dfu_initiated = true;
+        dubby_dfu_marker_set();
+#endif
+
+        slot->type = IoStatus::Type::Write;
+        slot->start_time = System::GetNow();
+        slot->start_address = (uint32_t)dest;
+        slot->length = Len;
+        slot->seq = io_seq_next++;
+        slot->busy = true;  // publish last
         return Result::OK;
     }
 
@@ -235,6 +281,16 @@ DFUHandle::Result DFUHandle::Impl::MemoryWrite(uint8_t *src, uint8_t *dest, uint
 DFUHandle::Result DFUHandle::Impl::MemoryRead(uint8_t *src, uint8_t *dest, uint32_t Len)
 {
     uint32_t tstart = System::GetNow();
+    // Diagnostic window: DFU UPLOAD from the DTCM region returns raw memory,
+    // so the dfu_log ring (0x20004000) can be pulled off a failed session with
+    // dfu-util -U before the device is reset.
+    uint32_t src_addr = (uint32_t)src;
+    if (src_addr >= 0x20000000U && (src_addr + Len) <= 0x20020000U)
+    {
+        for (size_t i = 0; i < Len; i++)
+            dest[i] = *((__IO uint8_t *)src_addr + i);
+        return Result::OK;
+    }
     if (System::GetMemoryRegion((uint32_t)src) == System::MemoryRegion::QSPI)
     {
         // TODO -- this will need to change for multi-programs
@@ -259,6 +315,51 @@ DFUHandle::Result DFUHandle::Impl::MemoryStatus(uint32_t Add, uint8_t Cmd, uint8
     uint32_t tstart = System::GetNow();
     switch (Cmd)
     {
+#ifdef DUBBY_DFU_POLL_TIMEOUTS
+    // The ST DFU class calls MEM_If_Write/Erase from EP0_TxReady, i.e. right
+    // after the GETSTATUS reply that carries this bwPollTimeout has been sent.
+    // Our Write/Erase only queue the job (io_state) and the QSPI work happens
+    // later in the main loop; the next Write/Erase returns ERR (-> dfuERROR,
+    // bStatus errVENDOR) if the previous job is still busy. So the advertised
+    // timeout must cover the WORST-CASE duration of the job just queued, not
+    // the typical one, or a host that polls on time (dfu-util) will send the
+    // next block too early. IS25LP064A datasheet maxima (see comments below):
+    // page program 0.8 ms per 256 B, 64 KB block erase 1.0 s.
+    case DFU_MEDIA_PROGRAM:
+    {
+        // One transfer = USBD_DFU_XFER_SIZE bytes = N pages of 256 B.
+        // Datasheet says <1 ms per page, but the driver's real service time is
+        // an order of magnitude higher (mode switches, HAL polling). If the
+        // advertised timeout is below the true service time the host's arrival
+        // rate matches or beats the service rate, queue latency accumulates and
+        // the transfer collapses (observed on rev10: 28-40 ms writes against an
+        // 8 ms advertisement). Advertise measured service time plus headroom.
+        uint32_t floor_ms = (USBD_DFU_XFER_SIZE / 256U) * 1U + 4U;
+        uint32_t timeout = last_write_ms + (last_write_ms / 2U) + 4U;
+        if (timeout < floor_ms) timeout = floor_ms;
+        if (timeout > 500U) timeout = 500U;
+        buffer[0] = 0; // bStatus (0 = OK)
+        buffer[1] = (uint8_t)(timeout & 0xffU);
+        buffer[2] = (uint8_t)((timeout >> 8) & 0xffU);
+        buffer[3] = (uint8_t)((timeout >> 16) & 0xffU);
+        buffer[4] = 4; // bState (4 = dfuDNBUSY)
+        buffer[5] = 0; // no state string
+        break;
+    }
+    default:
+    case DFU_MEDIA_ERASE:
+    {
+        // 64 KB block erase: typ 0.15 s, max 1.0 s (datasheet), plus margin
+        uint32_t timeout = 1000U + 100U;
+        buffer[0] = 0; // bStatus (0 = OK)
+        buffer[1] = (uint8_t)(timeout & 0xffU);
+        buffer[2] = (uint8_t)((timeout >> 8) & 0xffU);
+        buffer[3] = (uint8_t)((timeout >> 16) & 0xffU);
+        buffer[4] = 4; // bState (4 = dfuDNBUSY)
+        buffer[5] = 0; // no state string
+        break;
+    }
+#else
     case DFU_MEDIA_PROGRAM:
         buffer[0] = 0; // bStatus (0 = OK) TODO -- make this actually check the status
         // I'm assuming this is little-endian
@@ -293,6 +394,7 @@ DFUHandle::Result DFUHandle::Impl::MemoryStatus(uint32_t Add, uint8_t Cmd, uint8
         buffer[4] = 4;   // bState (4 = dfuDNBUSY)
         buffer[5] = 0;   // no state string
         break;
+#endif // DUBBY_DFU_POLL_TIMEOUTS
     }
     uint32_t tend = System::GetNow();
     auto dur = tend - tstart;
@@ -352,48 +454,56 @@ DFUHandle::Result DFUHandle::Impl::ProcessIoRequests()
         // io_state.start_address = Add;
         // io_state.length = sector_size_;
 
-    // Only one request can be handled at a time so we have one state
-    // instead of list of requests, etc.
-    if (io_state.busy) {
-        // take care of business
-        switch(io_state.type) {
+    // Process queued jobs in submission order. The ISR never touches a slot
+    // whose busy flag is set, so reading a busy slot's fields here is safe.
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        IoStatus* job = nullptr;
+        if (io_slots[0].busy && io_slots[1].busy)
+            job = ((int32_t)(io_slots[0].seq - io_slots[1].seq) < 0) ? &io_slots[0] : &io_slots[1];
+        else if (io_slots[0].busy)
+            job = &io_slots[0];
+        else if (io_slots[1].busy)
+            job = &io_slots[1];
+        if (!job)
+            break;
+
+        switch (job->type) {
             case IoStatus::Type::Erase:
             {
-                uint32_t normalized_addr = io_state.start_address - addr_offset_;
-                qspi_->Erase(normalized_addr, normalized_addr + io_state.length);
+                uint32_t normalized_addr = job->start_address - addr_offset_;
+                qspi_->Erase(normalized_addr, normalized_addr + job->length);
                 dfu_log.pushEvent(
                     DfuLogger::Event::Type::Erase,
-                    io_state.start_time,
-                    io_state.start_address,
-                    io_state.length,
-                    System::GetNow() - io_state.start_time
+                    job->start_time,
+                    job->start_address,
+                    job->length,
+                    System::GetNow() - job->start_time
                 );
-                // Clear busy flag
-                io_state.busy = false;
             }
             break;
             case IoStatus::Type::Write:
             {
-                uint32_t normalized_addr = io_state.start_address - addr_offset_;
-                qspi_->Write(normalized_addr, io_state.length, io_buffer);
+                uint32_t normalized_addr = job->start_address - addr_offset_;
+                uint32_t t0 = System::GetNow();
+                qspi_->Write(normalized_addr, job->length, job->buf);
+                uint32_t t1 = System::GetNow();
+                last_write_ms = t1 - t0;
                 dfu_log.pushEvent(
                     DfuLogger::Event::Type::Write,
-                    io_state.start_time,
-                    io_state.start_address,
-                    io_state.length,
-                    System::GetNow() - io_state.start_time
+                    job->start_time,
+                    job->start_address,
+                    job->length,
+                    System::GetNow() - job->start_time
                 );
-                data_written_ += io_state.length;
-                // Clear busy flag
-                io_state.busy = false;
+                data_written_ += job->length;
             }
             break;
             case IoStatus::Type::Idle:
-            io_state.busy = false;
             break;
         }
+        job->busy = false;  // release the slot last
     }
-
 
     return Result::OK;
 }
@@ -413,6 +523,9 @@ extern "C"
     uint8_t *MEM_If_Read_FS(uint8_t *src, uint8_t *dest, uint32_t Len);
     uint16_t MEM_If_DeInit_FS(void);
     uint16_t MEM_If_GetStatus_FS(uint32_t Add, uint8_t Cmd, uint8_t *buffer);
+#if (USBD_DFU_VENDOR_EXIT_ENABLED == 1U)
+    uint16_t MEM_If_Leave_FS(uint32_t Add);
+#endif
 
     __ALIGN_BEGIN USBD_DFU_MediaTypeDef USBD_DFU_fops_FS __ALIGN_END =
         {
@@ -422,7 +535,11 @@ extern "C"
             MEM_If_Erase_FS,
             MEM_If_Write_FS,
             MEM_If_Read_FS,
-            MEM_If_GetStatus_FS};
+            MEM_If_GetStatus_FS,
+#if (USBD_DFU_VENDOR_EXIT_ENABLED == 1U)
+            MEM_If_Leave_FS,
+#endif
+    };
 
     /**
      * @brief  Memory initialization routine.
@@ -473,8 +590,10 @@ extern "C"
      */
     uint8_t *MEM_If_Read_FS(uint8_t *src, uint8_t *dest, uint32_t Len)
     {
-        /* Return a valid address to avoid HardFault */
-        return (uint8_t *)dfu_impl.MemoryRead(src, dest, Len);
+        /* Return the destination buffer on success, NULL on error. The old
+           code cast the Result enum to a pointer, so OK (=0) read as NULL
+           and every DFU UPLOAD stalled. */
+        return dfu_impl.MemoryRead(src, dest, Len) == DFUHandle::Result::OK ? dest : nullptr;
     }
 
     /**
@@ -489,10 +608,36 @@ extern "C"
         return dfu_impl.MemoryStatus(Add, Cmd, buffer);
     }
 
+    // NOTE: nothing in this build calls enable_jump(). The ST DFU class leaves
+    // DFU mode from DFU_Leave() with USBD_Stop() + NVIC_SystemReset(); the
+    // application is then started by the bootloader's boot timeout after the
+    // reset. The only hook on that path is LeaveDFU (USBD_DFU_VENDOR_EXIT_ENABLED).
     void enable_jump()
     {
         dfu_impl.dfu_complete = true;
     }
+
+#if (USBD_DFU_VENDOR_EXIT_ENABLED == 1U)
+    /**
+     * @brief  Called by the ST DFU class from DFU_Leave() after USBD_Stop(),
+     *         i.e. the host has finished the download and issued the leave
+     *         request (manifest complete). With USBD_DFU_VENDOR_EXIT_ENABLED
+     *         the class does not reset by itself, so this function must.
+     *         Behaviour is identical to the stock class (system reset, then
+     *         the normal boot timeout starts the application), plus clearing
+     *         the incomplete-download marker first.
+     */
+    uint16_t MEM_If_Leave_FS(uint32_t Add)
+    {
+        (void)Add;
+#ifdef DUBBY_STAY_IN_DFU_IF_INCOMPLETE
+        // Manifest reached: the image in QSPI is complete
+        dubby_dfu_marker_clear();
+#endif
+        NVIC_SystemReset();
+        return (USBD_OK);
+    }
+#endif /* USBD_DFU_VENDOR_EXIT_ENABLED */
 }
 
 /////////////////////////////////////////////////
@@ -508,6 +653,11 @@ DFUHandle::Result DFUHandle::Init(QSPIHandle* qspi)
 DFUHandle::Result DFUHandle::DeInit()
 {
     return pimpl_->DeInit();
+}
+
+bool DFUHandle::IsIoIdle()
+{
+    return pimpl_->IsIoIdle();
 }
 
 bool DFUHandle::GetDfuComplete()

@@ -46,6 +46,10 @@ class DFUHandle
     /** Returns true if a DFU transaction has been initiated */
     bool GetDfuInitiated();
 
+    /** Returns true when no queued QSPI job is outstanding. Check together
+     *  with GetDfuComplete() before jumping so the last write is on flash. */
+    bool IsIoIdle();
+
     /** Method to call within main() while loop, or other
      *  low-priority callback that can be interrupted.
      *
