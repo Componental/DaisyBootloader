@@ -574,8 +574,10 @@ extern "C"
      */
     uint8_t *MEM_If_Read_FS(uint8_t *src, uint8_t *dest, uint32_t Len)
     {
-        /* Return a valid address to avoid HardFault */
-        return (uint8_t *)dfu_impl.MemoryRead(src, dest, Len);
+        /* Return the destination buffer on success, NULL on error. The old
+           code cast the Result enum to a pointer, so OK (=0) read as NULL
+           and every DFU UPLOAD stalled. */
+        return dfu_impl.MemoryRead(src, dest, Len) == DFUHandle::Result::OK ? dest : nullptr;
     }
 
     /**
