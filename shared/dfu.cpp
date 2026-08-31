@@ -97,6 +97,10 @@ private:
     // second slot absorbs that overlap; order is kept via seq.
     IoStatus io_slots[2];
     volatile uint32_t io_seq_next = 0;  // written from the ISR only
+    // Measured QSPI service time of the most recent write job (processing
+    // only, excluding queue wait). Drives the advertised bwPollTimeout so the
+    // host paces itself to the actual flash speed instead of a constant.
+    volatile uint32_t last_write_ms = 0;
     uint8_t* io_buffer;                 // slot 0 buffer (init)
     size_t io_buffer_size;
 
@@ -323,8 +327,17 @@ DFUHandle::Result DFUHandle::Impl::MemoryStatus(uint32_t Add, uint8_t Cmd, uint8
     // page program 0.8 ms per 256 B, 64 KB block erase 1.0 s.
     case DFU_MEDIA_PROGRAM:
     {
-        // One transfer = USBD_DFU_XFER_SIZE bytes = N pages of 256 B
-        uint32_t timeout = (USBD_DFU_XFER_SIZE / 256U) * 1U /* ms, >= 0.8 max */ + 4U /* margin */;
+        // One transfer = USBD_DFU_XFER_SIZE bytes = N pages of 256 B.
+        // Datasheet says <1 ms per page, but the driver's real service time is
+        // an order of magnitude higher (mode switches, HAL polling). If the
+        // advertised timeout is below the true service time the host's arrival
+        // rate matches or beats the service rate, queue latency accumulates and
+        // the transfer collapses (observed on rev10: 28-40 ms writes against an
+        // 8 ms advertisement). Advertise measured service time plus headroom.
+        uint32_t floor_ms = (USBD_DFU_XFER_SIZE / 256U) * 1U + 4U;
+        uint32_t timeout = last_write_ms + (last_write_ms / 2U) + 4U;
+        if (timeout < floor_ms) timeout = floor_ms;
+        if (timeout > 500U) timeout = 500U;
         buffer[0] = 0; // bStatus (0 = OK)
         buffer[1] = (uint8_t)(timeout & 0xffU);
         buffer[2] = (uint8_t)((timeout >> 8) & 0xffU);
@@ -472,7 +485,10 @@ DFUHandle::Result DFUHandle::Impl::ProcessIoRequests()
             case IoStatus::Type::Write:
             {
                 uint32_t normalized_addr = job->start_address - addr_offset_;
+                uint32_t t0 = System::GetNow();
                 qspi_->Write(normalized_addr, job->length, job->buf);
+                uint32_t t1 = System::GetNow();
+                last_write_ms = t1 - t0;
                 dfu_log.pushEvent(
                     DfuLogger::Event::Type::Write,
                     job->start_time,
