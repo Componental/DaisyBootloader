@@ -137,6 +137,7 @@ class Bootloader
     USBHostHandle msd_;
 
     bool sd_skip_;
+    uint32_t sd_rescan_after_ms_ = 0;
     bool usb_skip_;
     FIL FatfsFile_;
 
@@ -164,6 +165,10 @@ class Bootloader
 
     Switch boot_button_;
     bool boot_button_pressed_;
+#ifdef DUBBY_ENCODER_DFU
+    Switch enc_button_;  // Dubby rev 10 encoder switch, read through the control mux
+    GPIO   enc_sel_[4];  // mux select lines S1..S4
+#endif
     bool dfu_initialized_;
 
     bool downloading_binary_;
