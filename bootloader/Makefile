@@ -2,7 +2,7 @@
 PROJECT_NAME = dsy_bootloader
 
 VERSION_MAJ=6
-VERSION_MIN=4
+VERSION_MIN=5
 
 # Modification flag for using external USB port as DFU
 #C_DEFS += -DDSY_DFU_USE_EXT_USB=1
