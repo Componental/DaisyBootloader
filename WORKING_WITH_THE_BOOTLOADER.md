@@ -7,8 +7,9 @@ of DFU hardening fixes for reliable field firmware updates.
 ## Remotes
 
 - `origin` → `electro-smith/DaisyBootloader` — upstream. Never push here.
-- `componental` → `Componental/DaisyBootloader` — our fork. All branches and
-  PRs live here.
+- `componental` → `Componental/dubbyBootloader` — our fork (renamed from
+  `Componental/DaisyBootloader` on 3 Sep 2026; GitHub redirects the old URL).
+  All branches and PRs live here.
 
 ## libDaisy
 
@@ -29,8 +30,8 @@ most common cause.
 ## Getting the code
 
 ```sh
-git clone --recursive git@github.com:Componental/DaisyBootloader.git
-cd DaisyBootloader
+git clone --recursive git@github.com:Componental/dubbyBootloader.git
+cd dubbyBootloader
 # or, in an existing clone:
 git fetch componental
 git checkout <branch-or-PR-branch>
