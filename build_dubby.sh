@@ -10,7 +10,9 @@ cd "$(dirname "$0")"
 STR='-DDSY_USB_DESC_MFR_STR=\"Componental\" -DDSY_USB_DESC_PRODUCT_STR=\"Dubby\"'
 # USBD_DFU_VENDOR_EXIT_ENABLED=1 adds the ST LeaveDFU hook, which is where the
 # incomplete-download marker is cleared (usbd_dfu.c is compiled by bootloader/Makefile, not by libDaisy).
-HARDENING='-DDUBBY_STAY_IN_DFU_IF_INCOMPLETE=1 -DDUBBY_ENCODER_DFU=1 -DDUBBY_DFU_POLL_TIMEOUTS=1 -DUSBD_DFU_VENDOR_EXIT_ENABLED=1'
+# USBD_DFU_XFER_SIZE=4096: a QSPI write costs the same ~36 ms for 1 KB or 4 KB, so
+# 4x fewer chunks is 4x faster (382 kB: 30 s -> 10 s, measured 3 Sep 2026). Slot buffers are 8 KB.
+HARDENING='-DDUBBY_STAY_IN_DFU_IF_INCOMPLETE=1 -DDUBBY_ENCODER_DFU=1 -DDUBBY_DFU_POLL_TIMEOUTS=1 -DUSBD_DFU_VENDOR_EXIT_ENABLED=1 -DUSBD_DFU_XFER_SIZE=4096'
 make -C libDaisy -j8
 mkdir -p dubby-dist
 make -C bootloader clean

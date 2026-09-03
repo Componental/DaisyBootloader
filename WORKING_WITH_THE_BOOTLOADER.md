@@ -101,7 +101,8 @@ dubsiren 382 kB, SD card inserted:
 |---|---|---|
 | upstream timeouts (no pacing) | **fails at 16 KB**, `errVENDOR` | host sends 1 KB every ~12 ms, a 1 KB QSPI write takes ~24 ms, the 2-slot queue fills after 16 blocks |
 | adaptive pacing (`DUBBY_DFU_POLL_TIMEOUTS`) | 50.8 s / 53.0 s | 117 ms between writes for 27 ms of work |
-| pacing + status fix (`fix/dfu-status-pacing`) | **30.9 s / 29.9 s** | 78 ms between writes, same write timeout |
+| pacing + status fix (`fix/dfu-status-pacing`) | 30.9 s / 29.9 s | 78 ms between writes, same write timeout |
+| + `USBD_DFU_XFER_SIZE=4096` | **10.7 s / 10.0 s** | 96 writes of 4 KB, a 4 KB write costs the same ~36 ms as a 1 KB one |
 
 So the pacing is **not optional** with dfu-util as the host: without it the
 transfer collapses deterministically on this hardware. "We never saw it
@@ -125,12 +126,13 @@ wait it out before it may poll again. So whatever `MemoryStatus`
   (`usbd_dfu.c` ~line 1114). Nothing was queued, so it is answered with
   1 ms. Before this fix every chunk paid the write wait twice.
 
-Remaining per-chunk cost (~78 ms) is ~40 ms advertised write wait plus
-~30 ms of USB round-trips (five transactions per 1 KB chunk). The next
-lever is `USBD_DFU_XFER_SIZE` 1024 → 4096: four times fewer round-trips
-and the mode-switch overhead amortised over 4 KB. Bench it the same way
-(two timed runs, pull the event log, check for busy events) before
-trusting it.
+Per-chunk cost is ~40 ms advertised write wait plus ~30 ms of USB
+round-trips (five transactions per chunk), and a QSPI write costs about
+the same whether it is 1 KB or 4 KB (the INDIRECT↔MEMORY_MAPPED switch
+dominates). So `USBD_DFU_XFER_SIZE=4096` (set in `build_dubby.sh`) cuts
+the chunk count 4× for the same per-chunk cost: 50 s → 10 s. The 8 KB DFU
+slot buffers in `shared/dfu.cpp` leave room for 8192 if ever needed; bench
+it the same way first (two timed runs, pull the event log, busy must be 0).
 
 To measure a change: flash the app **without** `:leave`, pull the DTCM log
 (next section), then check `busy` = 0 and the write-to-write gap. The
@@ -170,6 +172,8 @@ it does not always have every merged fix. As of writing:
 - PR #2 (`dubby-bootloader-hardening`) — merged as its own PR, but that
   merge is **not** in `main`'s history (main got a separate, later commit
   with just the USB string defines).
+- `fix/dfu-status-pacing` (local, on top of #3) — the status/erase timeout
+  fix and `USBD_DFU_XFER_SIZE=4096` above, plus this guide.
 - PR #3 (`fix/dfu-hardening` → `main`) — brings the actual hardening
   (stay-in-DFU marker, `MEM_If_Read` fix, DFU pacing/queue) into `main`.
   **Check its merge status before assuming `main` has the hardening.**
