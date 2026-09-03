@@ -101,6 +101,12 @@ private:
     // only, excluding queue wait). Drives the advertised bwPollTimeout so the
     // host paces itself to the actual flash speed instead of a constant.
     volatile uint32_t last_write_ms = 0;
+    // Measured QSPI service time of the most recent 64 KB erase job.
+    volatile uint32_t last_erase_ms = 0;
+    // Set when Write/Erase queued a job; cleared by MemoryStatus. A GETSTATUS
+    // with nothing queued is the reply to a SET_ADDRESS pointer command, which
+    // dfu-util sends before every chunk: there is no work to wait for.
+    volatile bool job_queued = false;
     uint8_t* io_buffer;                 // slot 0 buffer (init)
     size_t io_buffer_size;
 
@@ -212,6 +218,7 @@ DFUHandle::Result DFUHandle::Impl::MemoryErase(uint32_t Add)
         slot->length = sector_size_;
         slot->seq = io_seq_next++;
         slot->busy = true;  // publish last
+        job_queued = true;
         return Result::OK;
     }
 
@@ -258,6 +265,7 @@ DFUHandle::Result DFUHandle::Impl::MemoryWrite(uint8_t *src, uint8_t *dest, uint
         slot->length = Len;
         slot->seq = io_seq_next++;
         slot->busy = true;  // publish last
+        job_queued = true;
         return Result::OK;
     }
 
@@ -334,10 +342,20 @@ DFUHandle::Result DFUHandle::Impl::MemoryStatus(uint32_t Add, uint8_t Cmd, uint8
         // rate matches or beats the service rate, queue latency accumulates and
         // the transfer collapses (observed on rev10: 28-40 ms writes against an
         // 8 ms advertisement). Advertise measured service time plus headroom.
-        uint32_t floor_ms = (USBD_DFU_XFER_SIZE / 256U) * 1U + 4U;
-        uint32_t timeout = last_write_ms + (last_write_ms / 2U) + 4U;
-        if (timeout < floor_ms) timeout = floor_ms;
-        if (timeout > 500U) timeout = 500U;
+        uint32_t timeout;
+        if (!job_queued)
+        {
+            // SET_ADDRESS pointer (or any non-erase command): nothing queued.
+            timeout = 1U;
+        }
+        else
+        {
+            uint32_t floor_ms = (USBD_DFU_XFER_SIZE / 256U) * 1U + 4U;
+            timeout = last_write_ms + (last_write_ms / 2U) + 4U;
+            if (timeout < floor_ms) timeout = floor_ms;
+            if (timeout > 500U) timeout = 500U;
+        }
+        job_queued = false;
         buffer[0] = 0; // bStatus (0 = OK)
         buffer[1] = (uint8_t)(timeout & 0xffU);
         buffer[2] = (uint8_t)((timeout >> 8) & 0xffU);
@@ -349,8 +367,12 @@ DFUHandle::Result DFUHandle::Impl::MemoryStatus(uint32_t Add, uint8_t Cmd, uint8
     default:
     case DFU_MEDIA_ERASE:
     {
-        // 64 KB block erase: typ 0.15 s, max 1.0 s (datasheet), plus margin
-        uint32_t timeout = 1000U + 100U;
+        // 64 KB block erase: datasheet typ 0.15 s, max 1.0 s; measured on Dubby
+        // rev10/rev11 117-139 ms. Advertise twice the last measured erase plus
+        // margin, datasheet maximum until one has been measured.
+        uint32_t timeout = last_erase_ms ? (2U * last_erase_ms + 50U) : 1100U;
+        if (timeout > 1100U) timeout = 1100U;
+        job_queued = false;
         buffer[0] = 0; // bStatus (0 = OK)
         buffer[1] = (uint8_t)(timeout & 0xffU);
         buffer[2] = (uint8_t)((timeout >> 8) & 0xffU);
@@ -472,7 +494,9 @@ DFUHandle::Result DFUHandle::Impl::ProcessIoRequests()
             case IoStatus::Type::Erase:
             {
                 uint32_t normalized_addr = job->start_address - addr_offset_;
+                uint32_t t0 = System::GetNow();
                 qspi_->Erase(normalized_addr, normalized_addr + job->length);
+                last_erase_ms = System::GetNow() - t0;
                 dfu_log.pushEvent(
                     DfuLogger::Event::Type::Erase,
                     job->start_time,
