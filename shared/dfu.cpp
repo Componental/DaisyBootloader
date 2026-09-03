@@ -301,10 +301,13 @@ DFUHandle::Result DFUHandle::Impl::MemoryRead(uint8_t *src, uint8_t *dest, uint3
     }
     if (System::GetMemoryRegion((uint32_t)src) == System::MemoryRegion::QSPI)
     {
-        // TODO -- this will need to change for multi-programs
+        // src IS the QSPI address (the ST class passes data_ptr + offset). The
+        // memory-mapped window is active between jobs, so read it directly.
+        // Previously this dereferenced src and added the byte to QSPI_BASE,
+        // so every DFU upload of the application image returned garbage and
+        // an image could not be verified after a download.
         for (size_t i = 0; i < Len; i++)
-            dest[i] = *((__IO uint8_t *)QSPI_BASE + *src + i);
-        // dest[i] = qspi_buffer[*src + i];
+            dest[i] = *((__IO uint8_t *)src_addr + i);
         // Log
         uint32_t tend = System::GetNow();
         auto dur = tend - tstart;
