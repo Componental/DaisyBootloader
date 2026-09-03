@@ -55,10 +55,12 @@ This builds the Componental/Dubby variants and drops them in `dubby-dist/`:
 | `*-intdfu-*` | DFU over the Seed's own micro-USB | Bench-testing a bare Seed2 DFM |
 | `*-intdfu-*-bench` | intdfu + hardening defines | Testing hardening on a bare Seed2 before touching a Dubby |
 
-The hardening defines (`DUBBY_STAY_IN_DFU_IF_INCOMPLETE`,
-`DUBBY_ENCODER_DFU`, `DUBBY_DFU_POLL_TIMEOUTS`, `USBD_DFU_VENDOR_EXIT_ENABLED`)
-are applied to the extdfu variant only — see `shared/dubby_hardening.h` for
-what each one does. Upstream/default builds are unaffected.
+The Dubby defines (`DUBBY_ENCODER_DFU`, `DUBBY_DFU_POLL_TIMEOUTS`,
+`USBD_DFU_XFER_SIZE=4096`) are applied to the extdfu and intdfu-bench variants
+only; upstream/default builds are unaffected. `DUBBY_STAY_IN_DFU_IF_INCOMPLETE`
+(the marker in backup SRAM, `shared/dubby_hardening.h`) exists in the code but
+is **off** in `build_dubby.sh`: it left units stuck in DFU, and encoder-hold at
+power-on is the recovery path after an interrupted download.
 
 VS Code: `.vscode/tasks.json` has a default "Build Bootloader" task, but it's
 plain `make clean && make` in `bootloader/` with none of the Dubby defines —
